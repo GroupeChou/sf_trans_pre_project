@@ -1,0 +1,145 @@
+# 中转场地的历史到达件量：dm_transfer_arrive_batch_flow_static_dtl_di.csv
+## 字段：
+发出班次日期	send_batch_date	string	
+发出网点代码	send_zone_code	string	
+发出网点类型	dept_type_name	string	
+发出网点班次代码	send_batch_code	string	
+到达班次日期	batch_date	string	
+到达场地代码	trans_code	string	
+到达场地类型代码	dest_dept_type_code	string	
+到达场地班次代码	batch_code	string	
+到达件量	actual_arrive_count	bigint	
+到达重量	modify_actual_arrive_weight	double	
+到达班次等级	batch_level	string	
+到达班次类型:1集 2散 3集散	dstr_type	string	
+到达班次名称	batch_name	string	
+运输等级	transoport_level	string	
+集散货标记: 1集(始发地为网点);目的地为中转场) 2散(始发地为中转场);目的地为中转场)	jsz_type	string	
+分区字段（实际为到达班次日期做的分区字段）	inc_day	string	
+## 备注：中转场地一天有多个班次，这个表记录了每个场地每天每个班次详细的到件信息，并可以看到从哪些场地发过来的。
+
+# 业务区历史收派量：ads_static_area_base.csv
+## 字段：
+日期	days	string	
+收派类型	type	string	
+业务区代码	area_code	string	
+产品板块	income_code	string	
+票数	all_waybill_num	bigint	
+件数	all_quantity	bigint	
+重量	weight	double	
+分区字段（收件日期或者派件日期，如果type为pickup则为收件日期，反之为派件日期） inc_day	string	
+## 备注：记录了场地所属业务区的 历史每天实际收件量以及派件量，一般来看收件量来用作中转场地的集货预测参考，派件量用来中转场地的散货预测参考
+
+
+# 场地每天每个班次每个小时时点的到件量：dws_trans_static_arrive_hour_sum_di.csv
+## 字段：
+发出网点代码	src_zone_code	string	
+到达场地代码	trans_code	string	
+到达场地班次代码	batch_code	string	
+到达班次日期	actual_arrive_dt	string	
+运输等级，全货机101，散航102，其他为transoport_level	new_transoport_level	string	
+目的地集散类型	jsz_type	string	
+满载重量	full_load_weight	double	
+实际到车小时	actual_arrive_hour	string	
+小时到达件量	hour_actual_arrive_count	bigint	
+小时到达重量	hour_actual_arrive_weight	double	
+分区日期(到达班次日期)	inc_day	string	
+到达时点	hour	string	
+## 备注：看中转场地每个小时实际到了多少件量
+
+# 业务区-城市-场地映射关系：hxh_dim_department_snap.csv
+## 字段：
+网点代码	dept_code	string	
+网点名称	dept_name	string	
+网点类型	dept_type_name	string	
+城市代码	dist_code	string	
+城市名称	dist_name	string	
+业务区代码	area_code	string	
+业务区名称	area_name	string	
+## 备注：网点代表中转场地，可以查询到中转场地代码 所属哪个城市，所属哪个业务区，业务区类似于省份的概念，是营运角度组织大区的划分标准
+
+# 场地班次更细粒度线路需求及车型角度下的历史实际件量及重量：dm_next_vehicle_task_split_dynamic_mid_hi.csv
+## 字段：
+需求日期	line_require_date	string	
+线路编码	line_code	string	
+运输等级	transoport_level	string	
+需求类型  (1 计划需求,2 临时需求)	line_require_type	string	
+运力载量 （车型，单位T），实际>计划	capacity_load	double	
+满载重量	full_load_weight	double	
+车辆类型	vehicle_type	string	
+线路始发场地	line_src_zone_code	string	
+线路目的场地	line_dest_zone_code	string	
+实际发出班次	actual_send_batch	string	
+实际发出班次日期	actual_send_batch_dt	string	
+实际到达班次	actual_arrive_batch	string	
+实际到达班次日期	actual_arrive_batch_dt	string	
+运力类型  (0 车辆,1 全货机,2 散航班, 3铁路)	capacity_type	bigint	
+运力数  task_cnt bigint
+里程数	line_distance	string	
+装载率	load_rate_value	string	
+集散货类型:1=集货，2=散货，3=集散货	collect_dispersal_type	string	
+业务类型： 0小件，1同城，2丰驰，3重货 ，4中港/中澳车，5冷运，6台湾，7香港，8澳门，9医药,10区域物流，11速运-区域物流，12同城-区域物流 13外部订单 14融通-快运 15融通-顺心 16大件 17丰网 18顺心 19仓配 80挂车调度任务 92接驳业务 91收派业务 93空驶调度 94空驶任务 95虚拟任务	biz_type	string	
+实发件量	actual_send_votes	bigint	
+实发重量	actual_send_weight	double	
+分区日期（到达日期）	inc_day	string	
+## 备注：可以统计车辆线路粒度的按天按班次的历史实际到达量信息
+
+# 场地规划运力需求及载重信息：dws_plan_batch_nextzone_dtl_hf_new.csv
+## 字段：
+计划线路编码	line_code	string	
+计划发出日期	send_date	string	
+计划到达日期	arrive_date	string	
+计划班次日期	batch_date	string	
+发出网点	src_dept_code	string	
+目的网点	dest_dept_code	string	
+发出城市	src_city_code	string	
+目的城市	dest_city_code	string	
+计划发出班次	send_batch	string	
+运力数     task_cnt  int
+是否取消	is_cancel	string	
+更新日期	inc_day	string	
+## 备注：可以统计未来规划的车辆线路粒度的按天按班次的未来规划线路信息
+
+
+# 业务区的动态时点预测信息：dynamic_pickup_area_model_result.csv
+## 字段：
+业务区	object_code	string	
+预测值	predict_value	double	
+预测日期	predicted_datetime	string	
+预测时点	predict_hour	string	
+更新日期（同预测日期）   20220101	inc_day	string	
+## 备注：记录了业务区当天预测当天的收派预测信息，属于未来预测
+
+
+# 业务区未来预测数据：dws_fc_flow_predict_collecting_di.csv
+## 字段：
+日期	predict_datetime	date	
+预测票量	predict_waybill	int	
+始发业务区	src_area_code	string	
+目的业务区	dest_area_code	string	
+分区日期（预测日期） yyyyMMdd	partition_key	string	
+## 备注：记录了未来业务区流向的未来长期预测信息，属于未来预测
+
+# 入网已经在途的场地当前的预计到达量：dm_vehicle_tasks_split_dtl_weight_hf.csv
+## 字段：
+线路编码	line_code	string	
+线路始发网点	line_src_zone_code	string	
+线路目的网点	line_dest_zone_code	string	
+运力类型(0 车辆,1 全货机,2 散航班, 3铁路)	capacity_type	bigint	
+运力载量（车型，单位T），实际>计划	capacity_load	double	
+pis推演到达班次日期	dy_arrive_batch_dt	string	
+pis推演到达班次	dy_arrive_batch	string	
+新推演预计到达班次日期	pre_arrive_batch_dt	string	
+新推演预计到达班次	pre_arrive_batch	string	
+班次等级	batch_level	string	
+集散类型	dstr_type	string	
+班次名称	batch_name	string	
+始发网点类型	src_dept_type_code	string	
+始发网点名称	src_dept_type_name	string	
+目的网点集散类型	jsz_type	string	
+目的网点类型	dest_dept_type_code	string	
+pis推演应到件量	should_arrive_count	bigint	
+在途件量	on_the_way_count	bigint	
+新推演预计到达件量	estimate_count	bigint	
+系统时点分区	inc_hour	string	
+## 备注：记录当前入网的在途运单里面，推演或预计 会在今天、明天、后天 到达某个场地的量是多少，是属于在途运单的未来估计，属于入网预测。新推演和pis是两个不同的入网运单推演预测模型。
