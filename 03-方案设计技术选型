@@ -1,0 +1,880 @@
+中转场地在线预测智能体平台 —— 技术选型开发指南
+
+> 版本：v1.2（数据适配修正版）
+> 日期：2026-06-04
+> 用途：指导后续项目开发的技术选型文档
+> 前置阅读：`中转场地在线预测智能体集群技术白皮书.md`、`研究报告_多智能体集群物流边缘预测架构.md`
+> 约束前提：面向公众的**多租户 SaaS 智能体平台**，不涉及边缘设备/物理部署约束
+> v1.2 修订：全面适配 9 张原始数据表——重构 Evidence Blackboard 证据类型枚举、新增 Data Adapter Layer（数据适配器层）、修正 15 套方案的输入数据和计算公式、集散分拆改为计算逻辑（非字段读取）、运力数（非车次）、日期事件自动解析、维度拆分统一交互模型
+
+---
+
+## 一、选型结论总览
+
+### 1.1 最终架构
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│                  AgentScope 平台底座（主控）               │
+│  · Agent Service — 多租户服务化                            │
+│  · Message Hub — Skill 间通信                             │
+│  · Studio — 可视化管理 / 审计 / 观测面板                   │
+│  · MCP / A2A Gateway — 开放协议                           │
+│  · HITL Gateway — 人工审核门禁                            │
+├──────────────────────────────────────────────────────────┤
+│              LangGraph StateGraph（嵌入编排引擎）           │
+│  · 预测主流程状态机                                       │
+│  · Checkpoint / 回滚 / 条件边                             │
+│  · Send API fan-out 并行调度                              │
+├──────────────────────────────────────────────────────────┤
+│                 自研预测层（领域核心）                       │
+│  ① Evidence Blackboard — 统一事实来源                     │
+│  ② Event Encoder — 非结构化事件→结构化特征向量（LLM 唯一入口）│
+│  ③ Forecast Claim Schema — 预测主张标准化                  │
+│  ④ Bayesian Fusion — 多 Skill 主张融合                    │
+│  ⑤ Conformal Calibration — 置信区间校准                   │
+│  ⑥ Thompson Sampling — Skill 权重自学习                   │
+├──────────────────────────────────────────────────────────┤
+│   HiClaw-style 协作房间（高风险 HITL）                     │
+│   ClawTeam-style Skill 工厂（离线 Skill 生成/回放/评审）    │
+└──────────────────────────────────────────────────────────┘
+```
+
+### 1.2 一句话选型原则
+
+> **AgentScope 做平台，LangGraph 做引擎，自研预测层做内核，HiClaw 做高风险人机协同，ClawTeam 做 Skill 供给侧。不是"选一个框架包打天下"，而是把不同框架放在它们最擅长的位置。**
+
+---
+
+## 二、各层详细选型与开发指引
+
+### 2.1 平台底座层：AgentScope-first
+
+**选型理由**：你要的是一个**面向公众开放的 SaaS 平台**，不是边缘计算集群。AgentScope 的原生能力——Agent Service（多租户）、Message Hub（通信）、Studio（可视化管理）、MCP/A2A Gateway（开放协议）——恰好是 SaaS 平台的刚需。
+
+**开发要点**：
+
+| 事项 | 说明 |
+|------|------|
+| **Agent Service** | 租户独立命名空间，每租户一个 Agent Service 实例或逻辑隔离 |
+| **工具权限** | 通过 MCP tools 注册预测工具（天气 API、历史数据查询、在途车辆查询），按租户 scope 控制 |
+| **消息协议** | Skill 间通信统一使用 ForecastClaim Schema (JSON)，通过 Message Hub 路由 |
+| **观测面板** | 基于 AgentScope Studio 暴露：租户级调用量、Skill 表现排名、Token 消耗、审计链路 |
+| **API 网关** | AgentScope 对外暴露统一 REST/gRPC 接口，租户通过 API Key 鉴权 |
+
+**注意事项**：
+- AgentScope 的 `to_dist()` Actor 分布式能力在单 SaaS 部署中仍有用——可用于隔离不同租户的 Skill 沙箱执行环境
+- 如果团队对 AgentScope 生态不熟悉，RPC/gRPC 学习曲线需要预留 1-2 周
+
+---
+
+### 2.2 编排引擎层：LangGraph StateGraph
+
+**选型理由**：预测流程是天然的状态机——`意图解析 → 取数 → 数据质量评估 → 选 Skill → 并行执行 → 协商 → 融合 → 校准 → HITL 门禁 → 发布`——LangGraph 的 StateGraph 精确匹配这个需求，且 Checkpoint + Time Travel 直接解决了审计和回滚。
+
+**开发要点**：
+
+```python
+# 状态定义
+class ForecastState(TypedDict):
+    trace_id: str
+    request: dict
+    intent: dict
+    evidence: dict
+    difficulty: float
+    selected_skills: List[str]
+    claims: List[ForecastClaim]
+    disagreement: dict
+    forecast: dict
+    hitl: dict
+
+# 15 节点状态机（v1.2 新增 framework_decompose + m1_route + user_input_gate）
+graph = StateGraph(ForecastState)
+
+graph.add_node("parse_intent", parse_intent_node)           # 🔴 LLM 意图解析
+graph.add_node("build_evidence", build_evidence_node)       # 🟢 DataAdapter 拉取 H1-H4, P1-P4, M0
+graph.add_node("parse_date", parse_date_node)               # 🟢 日期→节假日/周末/电商节
+graph.add_node("user_input_gate", user_input_gate_node)     # 🟢 检查框架所需用户输入
+graph.add_node("m1_route", m1_variant_router_node)          # 🟢 M1变体选择(a/b/c/d/e)
+graph.add_node("framework_decompose", framework_decompose_node) # 🟢 F1-F6→子部件分解
+graph.add_node("event_encode", event_encode_node)           # 🔴 LLM 事件→特征（有事件时）
+graph.add_node("score_difficulty", score_difficulty_node)   # 🟢 四维难度评分
+graph.add_node("select_team", select_team_node)             # 🟢 Thompson Sampling
+graph.add_node("run_skills", run_skills_parallel_node)      # 🟢 纯代码: 每子部件×指派方法
+graph.add_node("quality_gate", quality_gate_node)           # 🟢 规则校验
+graph.add_node("debate", bounded_debate_node)               # 🔴 LLM 有界辩论（分歧时）
+graph.add_node("fuse", bayesian_fusion_node)                # 🟢 纯数学融合
+graph.add_node("calibrate", conformal_calibration_node)     # 🟢 纯统计校准
+graph.add_node("hitl_gate", hitl_gate_node)                 # 🟢 阈值判断
+graph.add_node("publish", publish_node)                     # 🟢 纯代码
+graph.add_node("human_review", human_review_node)           # 🔴 人工介入（非 Token）
+
+# 条件边：用户输入不完整时，返回交互式补全
+graph.add_conditional_edges("user_input_gate",
+    lambda s: "m1_route" if s["user_input"]["gate_passed"] else "ask_user_input")
+
+# 条件边：无事件时跳过 event_encode
+graph.add_conditional_edges("framework_decompose",
+    lambda s: "event_encode" if s["evidence"]["has_unstructured_event"] else "score_difficulty")
+
+# 条件边
+graph.add_edge("event_encode", "score_difficulty")
+graph.add_conditional_edges("quality_gate", 
+    lambda s: "debate" if s["disagreement"]["requires_debate"] else "fuse")
+graph.add_conditional_edges("hitl_gate",
+    lambda s: "human_review" if s["hitl"]["required"] else "publish")
+```
+
+**注意事项**：
+- 深拷贝 State 在状态膨胀时 Token 开销高 → 用 `TypedDict` + `Annotated` 限制状态键，只传必要数据
+- LangGraph 默认串行 → 用 `Send` API 实现多个 Skill 并行执行
+- Checkpoint 用 PostgreSQL 做生产持久化（不用 InMemorySaver）
+- LangGraph 运行在 AgentScope 平台内部，不独立暴露服务端点
+
+---
+
+### 2.3 自研预测层：领域核心
+
+**为什么必须自研？**AgentScope / LangGraph 是"舞台和演员"——负责 Agent 通信、编排、HITL——但它们不理解物流预测的领域知识（如"暴雨衰减因子 0.7""客户上报虚高率 15%""22 点后 ETA 集中时 30% 跨班"）。以下是必须自研的五个模块。
+
+#### 2.3.1 Evidence Blackboard（统一事实来源）
+
+**职责**：所有 Skill 读取数据的唯一入口。不存真实数据，只存**结构化引用**。
+
+```python
+class EvidenceEntry:
+    type: str       # 证据类型（见下表）
+    source: str     # 数据来源标识（手册代码 + 表名）
+    timestamp: datetime
+    content_ref: str     # 指向实际数据的引用
+    ttl_seconds: int     # T+0模式V1-V4为3600s(每小时刷新)，其余86400s
+    quality_score: float # 数据质量分
+```
+
+**证据类型枚举**（对应手册 C1-C10/V1-V4 → 原始数据表，v1.2 修正）：
+
+| 证据类型 | 手册代码 | 原始数据表 | 时效性 | M1变体 | Skills |
+|---------|---------|----------|--------|--------|--------|
+| `site_arrival_ts` | C1 | H1: 场地班次到件 | T+1 | 全部(基期) | M1,M2,F6,V1,V2 |
+| `biz_area_vol` | C4 | H2: 业务区收派量(pickup/delivery) | T+1 | M1-a/b(基期) | M1,A1 |
+| `city_vol` | C3 | H2+M0聚合: 城市收派量 | T+1 | M1-c/d(基期) | M1(B1) |
+| `biz_area_dynamic` | V1 | P2: 业务区时点动态值 | **小时级** | **M1-a**(预测),**M1-b**(实际) | M1 |
+| `city_dynamic` | V2 | ⚠️ 原始数据无直接对应 | **小时级** | **M1-c**(预测),**M1-d**(实际) | M1(B1) |
+| `site_hourly` | V3 | H3: 小时级到件 | **小时级** | **M1-e'**(场地下钻) | D7,V3 |
+| `intransit` | V4 | P4: 在途(PIS+新推演) | **小时级** | — | M3,C2 |
+| `planned_cap` | C7 | P1: 规划运力数(仅二级场地) | 未来 | — | M2,V7 |
+| `vehicle_exec` | C1运力 | H4: 线路实际运力/载量 | T+1 | — | M2,V1,V5,V7 |
+| `flow_forecast` | C9 | P3: 业务区流向预测 | 未来 | M1-e(T+N) | Macro |
+| `biz_area_long_fc` | C10 | P3(收件/派件预测值) | 未来 | **M1-e**(T+N) | M1 |
+| `site_metadata` | C5 | M0: 场地↔城市↔业务区 | 快照 | — | 全部 |
+| `date_event` | C6 | 日期自动解析 | 静态 | — | F4 |
+| `user_input` | C2/C8/P2-P6 | 用户输入(占比/摸底/文件) | 实时 | — | M4,全部D类 |
+
+> **⚠️ 关键数据约束**（v1.2 对齐计算手册）：
+> - **集散标记不可用**：dstr_type/jsz_type/collect_dispersal_type 定义不一致 → 集散拆分由**用户上传比例**
+> - **V2(城市时点动态)缺失**：原始数据中无城市级时点数据 → M1-c/M1-d 变体需要独立接入城市预测系统，或从 V1 聚合近似
+> - **C7 仅二级场地**：P1(规划运力)需过滤出"二级场地→本场"的记录
+> - **维度细分全部依赖用户输入**：手册明确规定"只能由用户上传数据或对话告知比例"
+> - **M1 下钻规则**：V1/V2/C3/C4 不支持维度下钻（涨幅统一应用于所有子维度）；仅 V3(M1-e') 支持下钻
+> - 业务区预测数据(P2/P3)仅用作涨幅参考：业务区涨X% → 场地也涨X%
+> - 运力数以 task_cnt 为准（含车辆/全货机/散航班/铁路）
+
+#### 2.3.1.1 Data Adapter Layer（数据适配器，v1.2 新增）
+
+**职责**：将原始数据表转换为 Evidence Blackboard 的标准 EvidenceEntry 格式。每个 Skill 通过适配器读取数据，而非直接查询原始表。
+
+```python
+class DataAdapter:
+    """原始数据表 → Evidence Blackboard 标准格式"""
+    
+    # ── H1: 场地班次到件 ──
+    def load_site_arrival(self, site_code: str, days: int = 30) -> EvidenceEntry:
+        """从 dm_transfer_arrive_batch_flow 加载场地历史到件量"""
+        raw = query("dm_transfer_arrive_batch_flow_static_dtl_di", 
+                     filters={"trans_code": site_code, "days": days})
+        return EvidenceEntry(
+            type="site_arrival_timeseries",
+            source="H1",
+            content={
+                "daily_volume": raw.groupby("batch_date")["actual_arrive_count"].sum(),
+                "daily_weight": raw.groupby("batch_date")["modify_actual_arrive_weight"].sum(),
+                "shift_breakdown": raw.groupby(["batch_date", "batch_code"])["actual_arrive_count"].sum(),
+                "source_breakdown": raw.groupby(["batch_date", "send_zone_code"])["actual_arrive_count"].sum(),
+                "single_ticket_avg_weight": raw["modify_actual_arrive_weight"].sum() / raw["actual_arrive_count"].sum(),
+            },
+            quality_score=self.check_partition_freshness(raw, max_delay_days=2)
+        )
+    
+    # ── H2: 业务区收派量 ──
+    def load_biz_area_volume(self, area_code: str, days: int = 30) -> EvidenceEntry:
+        """从 ads_static_area_base 加载业务区收派量，用于涨幅基线"""
+        raw = query("ads_static_area_base", 
+                     filters={"area_code": area_code, "days": days})
+        return EvidenceEntry(
+            type="biz_area_volume",
+            source="H2",
+            content={
+                "pickup_daily": raw[raw["type"]=="pickup"].groupby("days")["all_quantity"].sum(),
+                "delivery_daily": raw[raw["type"]=="delivery"].groupby("days")["all_quantity"].sum(),
+                "by_product": raw.groupby(["days", "income_code"])["all_quantity"].sum(),
+            },
+            quality_score=self.check_partition_freshness(raw, max_delay_days=2)
+        )
+    
+    # ── P2: 业务区动态预测（涨幅来源）──
+    def load_biz_area_forecast(self, area_code: str) -> EvidenceEntry:
+        """从 dynamic_pickup_area_model_result 获取涨幅参考"""
+        raw = query("dynamic_pickup_area_model_result",
+                     filters={"object_code": area_code})
+        return EvidenceEntry(
+            type="biz_area_dynamic_forecast",
+            source="P2",
+            content={
+                "predicted_value": raw["predict_value"].iloc[-1],
+                "predict_hour": raw["predict_hour"].iloc[-1],
+                # 涨幅 = (预测值 - 昨日实际) / 昨日实际，需配合 H2 计算
+            },
+            quality_score=self.check_update_freshness(raw, max_delay_hours=4)
+        )
+    
+    # ── P4: 在途车辆（双模型）──
+    def load_intransit(self, site_code: str) -> EvidenceEntry:
+        """从 dm_vehicle_tasks_split_dtl_weight 加载在途数据，含双模型交叉"""
+        raw = query("dm_vehicle_tasks_split_dtl_weight_hf",
+                     filters={"line_dest_zone_code": site_code})
+        return EvidenceEntry(
+            type="intransit_realtime",
+            source="P4",
+            content={
+                "pis_model": {  # PIS 推演
+                    "should_arrive": raw["should_arrive_count"].sum(),
+                    "arrive_batch": raw["dy_arrive_batch"].unique().tolist(),
+                },
+                "new_model": {  # 新推演
+                    "estimate": raw["estimate_count"].sum(),
+                    "arrive_batch": raw["pre_arrive_batch"].unique().tolist(),
+                },
+                "on_the_way": raw["on_the_way_count"].sum(),
+                "model_divergence": abs(
+                    raw["should_arrive_count"].sum() - raw["estimate_count"].sum()
+                ) / max(raw["should_arrive_count"].sum(), raw["estimate_count"].sum(), 1),
+            },
+            quality_score=self.check_partition_freshness(raw, max_delay_hours=2)
+        )
+    
+    # ── 集散占比计算（D3 核心）──
+    def calc_jisan_ratio(self, site_code: str, area_code: str) -> dict:
+        """集散分拆核心计算: 场地占业务区的收/派比例"""
+        # 集货: 场地从网点收件量 / 业务区总收件量
+        site_from_network = query("dm_transfer_arrive_batch_flow",
+            filters={"trans_code": site_code})
+        # 通过 M0 过滤出来源为"网点(收派站)"的记录
+        network_stations = query("hxh_dim_department_snap",
+            filters={"dept_type_name": "收派站"})["dept_code"].tolist()
+        site_pickup = site_from_network[
+            site_from_network["send_zone_code"].isin(network_stations)
+        ]["actual_arrive_count"].sum()
+        
+        biz_pickup = query("ads_static_area_base",
+            filters={"area_code": area_code, "type": "pickup"})["all_quantity"].sum()
+        
+        # 散货: 场地从中转场收到的量 / 业务区总派件量
+        site_from_hub = site_from_network[
+            ~site_from_network["send_zone_code"].isin(network_stations)
+        ]["actual_arrive_count"].sum()
+        biz_delivery = query("ads_static_area_base",
+            filters={"area_code": area_code, "type": "delivery"})["all_quantity"].sum()
+        
+        return {
+            "ji_ratio": site_pickup / max(biz_pickup, 1),
+            "san_ratio": site_from_hub / max(biz_delivery, 1),
+            "ji_ratio_stability": self.calc_cv(site_pickup, biz_pickup, days=30),
+            "san_ratio_stability": self.calc_cv(site_from_hub, biz_delivery, days=30),
+        }
+    
+    # ── 日期事件自动解析 ──
+    def parse_date_events(self, target_date: str) -> EvidenceEntry:
+        """从预测日期自动解析节假日/周末/电商节等事件特征"""
+        dt = datetime.strptime(target_date, "%Y-%m-%d")
+        return EvidenceEntry(
+            type="date_event_features",
+            source="calendar",
+            content={
+                "weekday": dt.weekday(),
+                "is_weekend": dt.weekday() >= 5,
+                "is_holiday": self.check_holiday(dt),
+                "is_promo": self.check_promo_calendar(dt),  # 618/双11/年货节
+                "days_after_holiday": self.days_since_last_holiday(dt),
+                "days_before_holiday": self.days_to_next_holiday(dt),
+                "historical_impact_factor": self.get_historical_impact(target_date),
+            },
+            quality_score=1.0  # 日历数据始终可用
+        )
+```
+
+#### 2.3.1.2 Framework Decomposition Layer（框架分解层，v1.2 新增）
+
+**职责**：将用户选择的框架（F1-F6）分解为子部件，每个子部件独立指派方法（M1-M4），并行执行后合并。这是计算手册中"R1基期独立 + R2方法可组合 + R3多结果并存"三条约定的技术实现。
+
+```python
+class FrameworkDecomposer:
+    """将框架分解为子部件，每个子部件独立执行预测方法"""
+
+    FRAMEWORK_DEFS = {
+        "F1": {"parts": [("total", None)]},  # 不拆分
+        "F2": {"parts": [("集货", "pickup_side"), ("散货", "delivery_side")]},
+        "F3": {"parts": [("网点集货", "network_pickup"), ("大客户集货", "key_account"), ("散货", "delivery_side")]},
+        "F4": {"parts": [("集货", "pickup_side"), ("散货01D", "delivery_01d"), ("同城流转", "same_city", "subtract"), ("非01D", "non_01d")]},
+        "F5": {"parts": [("网点集货", "network_pickup"), ("大客户集货", "key_account"), ("散货01D", "delivery_01d"), ("同城流转", "same_city", "subtract"), ("非01D", "non_01d")]},
+        "F6": {"parts": [("网点集货", "network_pickup"), ("大客户集货", "key_account"), ("干线到件", "trunk_line"), ("临近区域", "adjacent_area")]},
+    }
+
+    def decompose(self, framework: str, user_inputs: dict) -> List[SubPart]:
+        """分解框架为子部件列表，每个子部件携带方法指派和用户提供的比例"""
+        parts_def = self.FRAMEWORK_DEFS[framework]["parts"]
+        sub_parts = []
+        for part_def in parts_def:
+            name, side = part_def[0], part_def[1]
+            sub_parts.append(SubPart(
+                name=name,
+                side=side,
+                ratio=user_inputs.get(f"{name}_ratio"),  # 用户提供的占比
+                method=user_inputs.get(f"{name}_method", "M1"),  # 用户指派的方法
+                baseline=user_inputs.get(f"{name}_baseline", "same_weekday"),  # 独立基期
+                operation=part_def[2] if len(part_def) > 2 else "add",  # add/subtract
+            ))
+        return sub_parts
+
+    def merge(self, sub_results: List[SubPartResult]) -> MergedForecast:
+        """合并子部件结果：加法部件求和，减法部件扣除"""
+        total = 0
+        for r in sub_results:
+            if r.operation == "subtract":
+                total -= r.forecast
+            else:
+                total += r.forecast
+        return MergedForecast(value=total, breakdown=sub_results)
+```
+
+#### 2.3.1.3 M1 Variant Router（M1变体路由器，v1.2 新增）
+
+**职责**：根据时间窗口（T+0/T+N）和数据可用性，自动选择 M1 的最佳变体。
+
+```python
+class M1VariantRouter:
+    """根据场景自动选择 M1 变体"""
+
+    def select_variant(self, time_window: str, evidence: dict, user_pref: str = "auto") -> str:
+        if time_window == "T+N":
+            # T+N 只能用 M1-e（长期预测数据）
+            if evidence.get("C10_available"):
+                return "M1-e"
+            else:
+                return "M1-e-fallback"  # 降级为最近基期外推
+        
+        # T+0 模式：按数据可用性优先选择
+        # 优先级：M1-a > M1-b > M1-c > M1-d > M1-e'
+        if evidence.get("V1_available"):
+            if evidence.get("V1_has_prediction"):
+                return "M1-a"  # 业务区时点预测值
+            else:
+                return "M1-b"  # 业务区时点实际值
+        elif evidence.get("V2_available"):
+            if evidence.get("V2_has_prediction"):
+                return "M1-c"  # 城市时点预测值
+            else:
+                return "M1-d"  # 城市时点实际值
+        elif evidence.get("V3_available"):
+            return "M1-e'"  # 场地时点（支持下钻）
+        else:
+            return "M1-fallback"  # 纯基期，无涨幅修正
+
+    def calc_growth_ratio(self, variant: str, evidence: dict, baseline_date: str) -> float:
+        """计算涨幅比率 — 核心公式对齐手册"""
+        if variant == "M1-a":
+            return evidence["V1_predicted"] / evidence["C4_baseline"]
+        elif variant == "M1-b":
+            return evidence["V1_current"] / evidence["V1_baseline_same_hour"]
+        elif variant == "M1-c":
+            return evidence["V2_predicted"] / evidence["C3_baseline"]
+        elif variant == "M1-d":
+            return evidence["V2_current"] / evidence["V2_baseline_same_hour"]
+        elif variant == "M1-e":
+            return evidence["C10_predicted"] / evidence["C4_baseline"]
+        elif variant == "M1-e'":
+            return evidence["V3_current"] / evidence["V3_baseline_same_hour"]
+```
+
+#### 2.3.1.4 User Input Gate（用户输入门禁，v1.2 新增）
+
+**职责**：在 Skill 执行前检查框架所需的用户输入是否已就绪。手册明确规定："维度细分数据都只能由用户上传数据或对话告知具体的比例数据来计算拆分，否则无法进行预测。"
+
+```python
+class UserInputGate:
+    """检查框架所需的用户输入是否完备"""
+    
+    REQUIRED_INPUTS = {
+        "F1": [],  # 无需额外输入
+        "F2": ["集货占比", "散货占比"],
+        "F3": ["网点集货占比", "大客户集货占比", "散货占比", "大客户摸底值"],
+        "F4": ["集货占比", "散货01D占比", "同城流转占比", "非01D占比"],
+        "F5": ["网点集货占比", "大客户集货占比", "散货01D占比", "同城流转占比", "非01D占比"],
+        "F6": ["网点集货占比", "大客户集货占比", "干线到件占比", "临近区域占比"],
+    }
+
+    def check(self, framework: str, user_inputs: dict) -> GateResult:
+        required = self.REQUIRED_INPUTS.get(framework, [])
+        missing = [r for r in required if r not in user_inputs]
+        if missing:
+            return GateResult(
+                passed=False,
+                missing_inputs=missing,
+                prompt=f"框架 {framework} 需要以下信息才能预测：{missing}。请提供比例或上传数据。"
+            )
+        # 验证比例之和为 100%
+        ratio_sum = sum(user_inputs.get(r, 0) for r in required if "占比" in r)
+        if abs(ratio_sum - 1.0) > 0.01:
+            return GateResult(passed=False, prompt=f"各部分占比之和应为100%，当前为{ratio_sum*100:.0f}%")
+        return GateResult(passed=True)
+```
+
+#### 2.3.2 Event Encoder（非结构化事件→特征向量）
+
+**职责**：整个预测链路中 **LLM Token 消耗的核心入口**。暴雨预警文本、客户临时通知、修路公告等非结构化事件，在进入 Skill 执行前统一由 Event Encoder 语义解析为结构化特征向量。
+
+**为什么放在 Blackboard 之后、Skill 执行之前？**
+- 事件编码只需执行 **一次**，结果被所有 Skill 共享复用
+- 如果每个 Skill 各自调 LLM 理解事件，Token 消耗会放大多倍
+- 编码后的结构化向量存入 Evidence Blackboard，Skill 只读结构化数据执行
+
+```python
+def event_encode_node(state: ForecastState):
+    """将非结构化事件文本编码为结构化特征向量，结果写入 Evidence Blackboard。"""
+    events = state["evidence"].get("unstructured_events", [])
+    if not events:
+        return {}  # 无事件时跳过，0 Token 消耗
+    
+    encoded = []
+    for event in events:
+        # 🔴 LLM 语义编码（~500-1500 tokens/次，一次编码，所有 Skill 复用）
+        vector = llm_encode_event(event)
+        encoded.append(vector)
+    
+    # 写入 Evidence Blackboard，供后续所有 Skill 读取
+    state["evidence"]["event_vectors"] = encoded
+    return {"evidence": state["evidence"]}
+```
+
+**事件编码输出示例**（即 Skill 实际消费的结构化输入）：
+
+```json
+{
+  "event_type": "weather_extreme",
+  "severity": 4,
+  "affected_areas": ["shanghai"],
+  "time_window": {"start": "14:00", "end": "20:00"},
+  "estimated_volume_decay": 0.65,
+  "estimated_delay_hours": 3,
+  "confidence": 0.75
+}
+```
+
+#### 2.3.3 Forecast Claim Schema（预测主张标准）
+
+**职责**：所有 Skill 输出必须遵循的统一 JSON Schema，机器可自动校验。
+
+```json
+{
+  "schema_version": "forecast.claim.v1",
+  "trace_id": "tr_20260603_001",
+  "skill_id": "B1",
+  "skill_version": "1.0.0",
+  "target": {
+    "site_code": "021WD",
+    "target_date": "2026-06-04",
+    "dimension": "shift",
+    "horizon": "T+1"
+  },
+  "claim": {
+    "type": "distribution",
+    "mean": 13200,
+    "p10": 11880,
+    "p90": 14520,
+    "confidence": 0.85
+  },
+  "evidence_refs": [
+    "evidence:city_dynamic:021WD:20260603",
+    "evidence:timeseries:021WD:shift:20260527"
+  ],
+  "assumptions": [
+    "上周同期基期实际值 12,000 件，城市预测涨跌幅 +10%",
+    "白班/晚班占比稳定，未考虑极端天气影响"
+  ],
+  "risk_flags": [],
+  "execution": {
+    "duration_ms": 450,
+    "parameters_used": {"base_period": "last_week_same_day", "smooth_window": 1}
+  }
+}
+```
+
+#### 2.3.4 Bayesian Fusion（多 Skill 融合）
+
+**职责**：将多个 Skill 的预测分布融合为一个。每个 Skill 的历史可靠性（MAPE 衰减）作为精度权重。
+
+```python
+def bayesian_fusion(claims: List[ForecastClaim]) -> FusedForecast:
+    """Bayesian precision-weighted fusion of multiple Skill claims."""
+    for claim in claims:
+        # 历史可靠性权重
+        reliability = exp(-MAPE_i / tau) * coverage_i * evidence_quality_i
+        # 精度 = 可靠性 / 方差
+        precision_i = reliability / (claim.sigma ** 2)
+    
+    # 精度加权融合
+    mu_fused = sum(precision_i * claim.mu) / sum(precision_i)
+    sigma_fused = sqrt(1 / sum(precision_i) + sigma_residual ** 2)
+    
+    return FusedForecast(mu=mu_fused, sigma=sigma_fused)
+```
+
+#### 2.3.5 Conformal Calibration（置信区间校准）
+
+**职责**：防止 Skill 过度自信。用历史残差分桶校准置信区间。
+
+```python
+def conformal_calibrate(fused: FusedForecast, bucket_key: str, alpha=0.2):
+    """Conformal prediction: calibrate PI using historical residuals."""
+    residuals = load_residuals(bucket_key)  # 按 site_type × event_type × horizon 分桶
+    q = quantile(residuals, 1 - alpha)
+    
+    return CalibratedForecast(
+        mean=fused.mu,
+        pi_lower=fused.mu - q,
+        pi_upper=fused.mu + q
+    )
+```
+
+#### 2.3.6 Thompson Sampling 权重学习（自进化）
+
+**职责**：每个 Skill 在每个场景 bucket 下维护 Bayesian 后验，上线时抽样决定选用哪些 Skill。
+
+```python
+def select_skills_with_thompson_sampling(
+    bucket: str, 
+    candidate_skills: List[str], 
+    n_select: int
+) -> List[str]:
+    """Thompson Sampling for dynamic team selection."""
+    scores = []
+    for skill_id in candidate_skills:
+        posterior = load_posterior(skill_id, bucket)
+        # 从后验分布抽样
+        sample = np.random.normal(posterior.mu, posterior.sigma)
+        scores.append((skill_id, sample))
+    
+    # 选 top-N
+    selected = sorted(scores, key=lambda x: x[1], reverse=True)[:n_select]
+    return [s[0] for s in selected]
+
+
+def update_posterior(skill_id: str, bucket: str, reward: float):
+    """T+1 实际件量回流后更新后验."""
+    posterior = load_posterior(skill_id, bucket)
+    
+    # 指数衰减 + 新观测
+    posterior.mu = 0.92 * posterior.mu + 0.08 * reward
+    posterior.sigma = max(0.05, posterior.sigma * 0.98)
+    posterior.n += 1
+    
+    save_posterior(skill_id, bucket, posterior)
+```
+
+---
+
+### 2.4 HITL 协作层：HiClaw-style
+
+**选型理由**：只在高风险场景触发（分歧指数 DI ≥ 0.50 或业务影响高），让场地主管/区域经理在协作房间中旁观 Agent 主张、人机共同决策。
+
+**触发条件**：
+
+| 条件 | 动作 |
+|------|------|
+| DI < 0.20 | 直接融合发布 |
+| 0.20 ≤ DI < 0.35 | 加权投票自动消解 |
+| 0.35 ≤ DI < 0.50 | 1 轮 Peer Review |
+| DI ≥ 0.50 | **触发 HiClaw-style 协作房间** |
+| 任一高影响事件缺证据 | **触发 HITL** |
+
+**协作房间 UI 元素**：
+
+```text
+┌─────────────────────────────────────────────┐
+│  高风险预测复核 — 021WD 金山场地               │
+│  预测日期：2026-06-04 白班                    │
+├─────────────────────────────────────────────┤
+│  Agent 主张：                                │
+│  ┌─────────────────────────────────────────┐ │
+│  │ B1 城市涨跌幅    → 13,200 件 (±10%)      │ │
+│  │ D1 大客户摸底    → 15,800 件 (置信中)     │ │
+│  │ F1 极端事件      → [10,000, 16,000]      │ │
+│  └─────────────────────────────────────────┘ │
+│  证据摘要：暴雨橙色预警 | 得物直播出货          │
+│  分歧指数：0.41                              │
+├─────────────────────────────────────────────┤
+│  [确认采用] [上调 ___] [下调 ___]             │
+│  [按事件重算] [查看完整证据] [回滚上版]         │
+└─────────────────────────────────────────────┘
+```
+
+---
+
+### 2.5 Skill 工厂层：ClawTeam-style（离线）
+
+**选型理由**：ClawTeam 不适合在线预测 serving，但非常适合 Skill 的**开发、回测、修复和评审**——这正是"业务发现新规律、IT 排期数周"痛点的解决方案。
+
+**工作流**：
+
+```text
+业务人员自然语言输入：
+  "以后遇到客户临时包机，先按客户上报量的 0.85 计入"
+
+          ↓ ClawTeam Leader Agent 分发
+
+┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐
+│CodeWorker│  │SchemaWkr │  │BacktestWkr│ │ReportWkr │
+│生成Python│  │生成YAML  │  │历史回放   │  │评审报告   │
+│ Skill代码 │  │Skill Card│  │误差分析   │  │          │
+└──────────┘  └──────────┘  └──────────┘  └──────────┘
+
+          ↓ Leader 汇总
+
+    Draft → Lint → Sandbox Backtest → Review → Published
+```
+
+---
+
+### 2.7 Token 成本设计原则
+
+**核心法则**：LLM 只做语义理解和异常推理，数值计算、统计融合、比例缩放、查表运算全部走代码。
+
+#### 2.7.1 全链路 Token 消耗分类
+
+| 节点 | 消耗类型 | Token 估算 | 触发条件 |
+|------|:---:|:---:|------|
+| **意图解析 (parse_intent)** | 🔴 LLM | ~300 | 每次请求（固定） |
+| **构建证据板 (build_evidence)** | 🟢 代码 | 0 | 每次请求 |
+| **事件编码 (event_encode)** | 🔴 LLM | ~800 | 有非结构化事件时 |
+| **难度评分 (score_difficulty)** | 🟢 代码 | 0 | 每次请求（VAE 小模型推理） |
+| **动态选团队 (select_team)** | 🟢 代码 | 0 | 每次请求（Thompson Sampling） |
+| **Skill 执行 (run_skills)** | 🟢 代码 | 0 | 12 个 Skill 中 10 个纯代码 |
+| **质量门禁 (quality_gate)** | 🟢 代码 | 0 | 每次请求 |
+| **有界辩论 (bounded_debate)** | 🔴 LLM | ~1500 | 仅 DI ≥ 0.35 时触发，max 2 轮 |
+| **贝叶斯融合 (bayesian_fusion)** | 🟢 代码 | 0 | 每次请求 |
+| **共形校准 (conformal_calibration)** | 🟢 代码 | 0 | 每次请求 |
+| **HITL 门禁 (hitl_gate)** | 🟢 代码 | 0 | 每次请求（阈值比较） |
+| **发布预测 (publish)** | 🟢 代码 | 0 | 每次请求 |
+
+#### 2.7.2 12 个 Skill 的 Token 消耗分类
+
+| 方案 | 计算方式 | Token | 原因 |
+|------|:---:|:---:|------|
+| **A1** 业务区占比拆解 | 🟢 | 0 | 业务区预测值 × 历史占比 → 纯乘法 |
+| **A2** 班次占比拆分 | 🟢 | 0 | 日总量 × 白/晚班占比 → 纯乘法 |
+| **A3** 时效推演拆解 | 🟢 | 0 | 按运输时效查表分桶 → 纯查表 |
+| **B1** 城市动态涨跌幅 | 🟢 | 0 | 基期实际 × (城市预测/城市基期) → 纯算术 |
+| **B2** 上周同比 | 🟢 | 0 | 上周同期 × 涨跌修正 → 纯算术 |
+| **C2** 在途车辆推演 | 🟢 | 0 | 24h ETA 车辆 × 单车载重 → 纯运算 |
+| **D1** 大客户摸底 | 🟡 | 少量 | 客户通知文本的语义理解依赖 event_encode（共享）；核心计算是代码 |
+| **E1** 集散分拆合并 | 🟢 | 0 | 集货 + 散货分口径计算后加总 |
+| **F1** 极端事件应对 | 🟡 | 少量 | 气象预警语义理解依赖 event_encode（共享）；区间评估是代码 |
+| **G2** 倒货管理 | 🟢 | 0 | 倒货率查询 + 来源产能量化 → 纯运算 |
+| **H1** 交叉验证 | 🟢 | 0 | 多数据源数值比对 → 纯比较逻辑 |
+| **H2** 四维度加总 | 🟢 | 0 | 四个维度各自用代码 Skill 算完 → 加总 |
+
+> **关键设计**：D1 和 F1 的 LLM 消耗不在 Skill 内部，而是在前置的 `event_encode` 节点统一完成。Skill 本身只消费已编码的结构化特征向量。
+
+#### 2.7.3 单次预测 Token 消耗预估
+
+```text
+平峰日常（无事件 / 无分歧）：       ~300 tokens
+有事件 + 无分歧：                 ~1100 tokens  (意图 + 事件编码)
+有事件 + 高分歧 + 辩论（≤2轮）：  ~2600 tokens  (意图 + 事件编码 + 辩论)
+
+对比基线：如果每个 Skill 都是 LLM Agent 自由对话
+          → 单次预测轻松突破 20,000 tokens ❌
+```
+
+#### 2.7.4 离线 Token 消耗（不计入在线 SLA）
+
+| 环节 | Token 消耗 | 频率 | 说明 |
+|------|:---:|------|------|
+| ClawTeam 工厂：自然语言 → Python Skill 代码 | 🔴🔴🔴 高 | 数周一次 | 离线执行，不影响在线延迟 |
+| ClawTeam 工厂：生成 YAML Skill Card | 🔴 低 | 同上 | |
+| ClawTeam 工厂：生成单元测试 | 🔴🔴 中 | 同上 | |
+| ClawTeam 工厂：评审报告生成 | 🔴🔴 中 | 同上 | |
+| ClawTeam 工厂：历史回放 | 🟢 0 | 同上 | 纯 Python 执行 |
+
+### 2.8 协议层：MCP + A2A
+
+| 协议 | 用途 | 开发要点 |
+|------|------|---------|
+| **MCP** | Agent ↔ Tool 垂直通信 | 标准化天气 API、历史数据查询、在途车辆查询的工具接口；`tools/list → tools/call` 流程 |
+| **A2A** | Agent ↔ Agent 水平通信 | Skill Card 遵循 A2A Agent Card 规范；Task 生命周期管理；`send_message` / `get_task` |
+
+---
+
+## 三、15 套调研方案 → Skill Market 转化路径（v1.2 数据适配修正版）
+
+> **数据约束前提**：集散标记不可用（改为计算公式）、无城市级数据（从业务区聚合）、业务区预测仅作用涨幅参考、运力数以 task_cnt 为准、日期事件自动解析、维度拆分由用户输入比例。
+
+现有 15 份人工预测方法文档（`中转场地调研预测方案/`目录下）是 Skill Market 的初始语料库。
+
+| 方案编号 | 方案名称 | 转化后 Skill 类型 | 输入数据(编号) | 核心计算公式 |
+|---------|---------|------------------|---------|---------|
+| A1 | 业务区占比拆解法 | `ts_baseline` + `dim_split` | H1+H2+P2+M0 | `H1基期 × (1+P2/H2涨幅)`；集散: 集=H2.pickup×场地占比, 散=H2.delivery×场地占比 |
+| A2 | 班次占比拆分法 | `ts_baseline` + `dim_split` | H1+H2+P2 | `M1日总量 × H1.batch_code历史占比` 或用户输入 |
+| A3 | 时效推演拆解法 | `ts_baseline` + `dim_split` | H1+H2+P2 | `M1日总量 × 运输时效查表 → 白/晚班分配` |
+| B1 | 城市动态涨跌幅法 | `ts_baseline` | H1+H2+P2+M0 | `H1基期 × (1+城市涨幅)` 城市涨幅=M0聚合各业务区涨幅加权 |
+| B2 | 上周同比法 | `ts_baseline` | H1 | `H1上周同日 × 涨跌修正系数` |
+| C1 | 运力数×均票法 | `capacity_constraint` | P1+H4+H1 | `P1规划运力数 × H4运力载量 × H4装载率 / H1单票均重` |
+| C2 | 在途车辆推演法 | `capacity_constraint` | P4 | `Σ(P4在途件量)` PIS与新推演双模型交叉验证 |
+| D1 | 大客户摸底法 | `user_input` | UI(用户输入) | `Σ(用户输入各客户摸底件量 × 历史偏差修正)` |
+| E1 | 集散分拆合并法 | `composition` | H1+H2+P1+P2+UI | **集**=H2.pickup×场地占比+M2, **散**=H2.delivery×场地占比, 合并=集+散+M4(UI) |
+| F1 | 极端事件应对方案 | `event_delta` | H1+H2+P2+H4+日期 | `M1基线 × F4事件系数(日期解析)` + V1运力校验 + V2趋势校验 |
+| G2 | 倒货管理与预测 | `event_delta` | H1+H4+UI | `V4: H1周边场地异常推断 + 用户确认` + V1运力校验 |
+| H1 | 多维度交叉验证法 | `calibration` | H1+H2+P2+H4 | M1+V1(H1件量 vs H4运力)+V2+V5 多源比对 |
+| H2 | 四维度分解加总法 | `composition` | H1+H2+P2+M0+UI | M1+M4(UI) → D4(H1+M0城市占比或用户输入) → 各维预测加总 |
+
+**转化步骤**（v1.2 修正）：
+
+1. 从各方案文档中提取：计算公式、数据输入 schema（**映射到 H1-H4/P1-P4/M0/UI**）、边界条件、校验规则
+2. **为每个 Skill 编写 DataAdapter 方法**：将原始表查询封装为标准 EvidenceEntry
+3. **维度拆分 Skill（D1-D7）接入 DimensionSplitter 组件**：统一"系统建议+用户覆盖"交互模式
+4. 通过 ClawTeam Skill 工厂生成 Python Skill 代码 + YAML Skill Card
+5. 在 Sandbox 中用历史数据回放，对比方案宣称的准确度
+6. 管理员 Review 通过后注册到 Skill Market
+7. 上线后由 Thompson Sampling 自动学习权重
+
+---
+
+## 四、预测主流程伪代码（v1.2 对齐计算手册）
+
+```python
+def forecast(request: ForecastRequest) -> ForecastResponse:
+    trace = new_trace(request)
+    
+    # === Step 1: 意图解析 ===
+    intent = parse_intent(request.text)                      # 🔴 LLM ~300 tokens
+    # 解析结果包含: site, date, time_window(T+0/T+N), 
+    # framework(F1-F6), dimensions[], events[]
+    
+    # === Step 2: 取数（DataAdapter 统一拉取） ===
+    evidence = build_blackboard(intent, trace)               # 🟢 拉取 H1-H4, P1-P4, M0
+    evidence += parse_date_events(intent.target_date)        # 🟢 日期事件自动解析
+    
+    # === Step 3: 用户输入门禁（对齐手册：维度细分必须用户提供） ===
+    gate = user_input_gate.check(intent.framework, intent.user_inputs)
+    if not gate.passed:
+        return ask_user_for_input(gate.prompt)               # 🟢 交互式补全
+    
+    # === Step 4: M1 变体路由（对齐手册5种变体） ===
+    m1_variant = m1_router.select_variant(                   # 🟢 自动选择
+        time_window=intent.time_window,  # T+0 或 T+N
+        evidence=evidence,
+    )
+    
+    # === Step 5: 框架分解（对齐手册 F1-F6 子部件分解） ===
+    sub_parts = framework_decomposer.decompose(              # 🟢 框架→子部件
+        framework=intent.framework,
+        user_inputs=intent.user_inputs,
+    )
+    
+    # === Step 6: 难度评估 + 动态团队选择 ===
+    difficulty = score_difficulty(intent, evidence)          # 🟢 四维难度评分
+    team = select_team_with_thompson_sampling(               # 🟢 Thompson Sampling
+        intent=intent, evidence=evidence,
+        difficulty=difficulty, registry=skill_registry,
+    )
+    
+    # === Step 7: 事件编码（有非结构化事件时） ===
+    evidence = event_encode(evidence)                        # 🔴 LLM ~800 tokens
+    
+    # === Step 8: 并行执行（每个子部件 × 指派方法） ===
+    claims = []
+    for part in sub_parts:
+        part_claims = run_skills_parallel(                   # 🟢 纯代码执行
+            team=team,
+            sub_part=part,
+            m1_variant=m1_variant,
+            evidence=evidence,
+            timeout=budget_for(difficulty),
+            trace=trace,
+        )
+        claims.extend(part_claims)
+    
+    # === Step 9: 框架合并（子部件结果按加/减合并） ===
+    merged = framework_decomposer.merge(claims)              # 🟢 子部件加总
+    
+    # === Step 10: 维度下钻（如用户指定了维度） ===
+    if intent.dimensions:
+        merged = apply_dimension_splits(                     # 🟢 用户提供的比例
+            merged, intent.dimensions, intent.user_inputs)
+    
+    # === Step 11: 质量门禁 + 分歧检测 ===
+    merged = quality_gate(merged)                            # 🟢 规则校验
+    disagreement = calc_disagreement(claims, intent)         # 🟢 纯计算
+    if disagreement.requires_debate:
+        claims = bounded_debate(claims, evidence,            # 🔴 LLM ~1500
+                                max_rounds=debate_rounds(difficulty))
+    
+    # === Step 12: Bayesian Fusion + Conformal Calibration ===
+    fused = bayesian_fusion(claims)                          # 🟢 纯数学
+    calibrated = conformal_calibrate(fused,                  # 🟢 纯统计
+        bucket=scenario_bucket(intent, evidence))
+    
+    # === Step 13: HITL 门禁 ===
+    hitl = hitl_gate(calibrated, disagreement,               # 🟢 阈值比较
+                     business_impact=intent.impact)
+    if hitl.required:
+        return send_to_human_review(calibrated, claims, evidence, trace)
+    
+    # === Step 14: 发布 + 记录 ===
+    publish_forecast(calibrated, trace)                      # 🟢 纯代码
+    return build_response(calibrated, claims, trace)
+```
+
+---
+
+## 五、开发阶段规划
+
+| 阶段 | 周期 | 目标 | 关键交付 |
+|------|------|------|---------|
+| **Phase 0：选型验证** | 2-3 周 | 验证 AgentScope + LangGraph 组合可行性 | AgentScope Service 部署、LangGraph 状态机原型、ForecastClaim Schema v1、选型验证报告 |
+| **Phase 1：MVP 单场景** | 4-6 周 | 端到端跑通一个场地的日常预测 | 3-5 个 Skill（B1/D1/F1/G2/H1）、Evidence Blackboard、基础融合、HITL Gateway |
+| **Phase 2：Skill 市场** | 8-10 周 | 12 个调研方案全部转化为 Skill，ClawTeam 工厂可用 | Skill Registry + Composer、全部 12 个 Skill 上线、回放评估报告 |
+| **Phase 3：自进化闭环** | 10-12 周 | DAAO 难度感知、Thompson Sampling、HITL 协作房间 | Dynamic Team Router、Bandit 更新、HiClaw-style 协作房间、分歧检测与辩论 |
+| **Phase 4：多租户平台化** | 12 周+ | 开放给所有业务人员使用 | 多租户隔离、租户级 quota/限流、方法论社区、A2A/MCP Gateway |
+
+---
+
+## 六、关键技术风险与缓解
+
+| 风险 | 影响 | 缓解策略 |
+|------|------|---------|
+| AgentScope 框架较重，团队学习曲线陡峭 | Phase 0 延期 | 预留 1-2 周学习期；先跑官方 tutorial；如遇阻塞可降级为纯 LangGraph 方案（已在 Phase 0 覆盖） |
+| LangGraph State 深拷贝导致 Token 开销高 | Phase 1 成本超预期 | 使用 `TypedDict` 限制状态键；Prompt Caching 降 90% 输入成本；Semantic Caching 消除 ~31% 冗余 |
+| Skill 冷启动时 Thompson Sampling 权重不稳定 | Phase 3 效果差 | 先验设置为保守值（小 sigma）；前 30 次采用均匀探索；Similar-Site Skill 迁移提供先验 |
+| HITL 协作房间触发过于频繁 | 业务人员"AI 疲劳" | 严格限制触发阈值（仅 DI ≥ 0.50 或高业务影响）；监控每周触发率 |
+| 12 个调研方案转化为 Skill 的准确度不达预期 | Phase 2 交付受阻 | 先转 3-5 个核心方案（B1/D1/F1/G2/H1）；回放不通过 → 人工修正 → 重新回放 |
+
+---
+
+## 七、相关文档索引
+
+| 文档 | 路径 |
+|------|------|
+| 技术白皮书（v1.1） | `需求文档/中转场地在线预测智能体集群技术白皮书.md` |
+| 研究报告（v1.0） | `需求文档/研究报告_多智能体集群物流边缘预测架构.md` |
+| 12 份人工预测方案 | `中转场地调研预测方案/` 目录 |
+| 预测全排列手册 | `my_docs/预测方案全排列计算手册.md` |
